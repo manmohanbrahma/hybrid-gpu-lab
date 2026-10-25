@@ -223,13 +223,17 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
   run mkdir -p "$dir"
   if [ "${DRY:-0}" = 1 ]; then echo "  # cloud-init user-data for $n:"; user_data "$n" "$r" | sed 's/^/  | /'
   else user_data "$n" "$r" > "$dir/user-data"; meta_data "$n" > "$dir/meta-data"; fi
+  # the NoCloud seed as a CD-ROM of our own: virt-install --cloud-init would leave the running VM with
+  # on_reboot=destroy (its install phase), so the VM's first reboot powered it off
+  local seed=$LAB_STORAGE/$dom-seed.iso
+  run genisoimage -quiet -output "$seed" -volid cidata -joliet -rock "$dir/user-data" "$dir/meta-data"
   run qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" "$disk" "${d}G"
   # shellcheck disable=SC2054   # commas belong to the virt-install options
   local args=(--name "$dom" --memory $((m * 1024)) --vcpus "$c" --cpu host-passthrough --machine q35
     --boot "loader=$LAB_OVMF_CODE,loader.readonly=yes,loader.type=pflash,loader_secure=no,nvram.template=$LAB_OVMF_VARS"
     --osinfo detect=on,require=off --import --disk "path=$disk,bus=virtio,cache=none,discard=unmap"
     --network "network=$LAB_NET_NAME,mac=$(mac_of "$i"),model=virtio"
-    --cloud-init "user-data=$dir/user-data,meta-data=$dir/meta-data"
+    --disk "path=$seed,device=cdrom,bus=sata,readonly=on" --events on_reboot=restart
     --graphics none --console pty,target_type=serial --noautoconsole --autostart)
   if [ "$g" != - ]; then
     for f in ${g//,/ }; do args+=(--hostdev "$f"); done
@@ -243,9 +247,11 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
     # what libvirt, QEMU and AppArmor said meanwhile (the journal and QEMU's log are root-only)
     { journalctl --no-pager -q --since "$t0" 2>/dev/null | grep -iE 'apparmor|virt-aa-helper|denied|virtqemud|libvirt' | tail -15
       tail -5 "/var/log/libvirt/qemu/$dom.log" 2>/dev/null; } | tee -a "$LOG" | sed 's/^/    /' >&2
-    virsh -q undefine "$dom" --nvram >/dev/null 2>&1 || true; rm -f "$disk"
+    virsh -q undefine "$dom" --nvram >/dev/null 2>&1 || true; rm -f "$disk" "$seed"
     die "virt-install $dom failed (above; full output in $LOG)"
   fi
+  # a reboot inside the VM must restart it (a GPU node reboots once for its driver)
+  virsh dumpxml "$dom" | grep -q '<on_reboot>restart</on_reboot>' || die "$dom would power off when it reboots (on_reboot)"
   ok "$dom started: $c vCPU, $m GiB, ${d} GiB disk, $NET_PREFIX.$i${g:+, GPU $g}"
 }
 
@@ -304,7 +310,7 @@ destroy() {
         || die "cannot undefine $dom"
       ok "$dom removed"
     fi
-    rm -f "$LAB_STORAGE/$dom.qcow2"; rm -rf "$STATE/seed/$n"
+    rm -f "$LAB_STORAGE/$dom.qcow2" "$LAB_STORAGE/$dom-seed.iso"; rm -rf "$STATE/seed/$n"
   done
   if virsh -q net-info "$LAB_NET_NAME" >/dev/null 2>&1; then
     virsh -q net-destroy "$LAB_NET_NAME" >/dev/null 2>&1 || true

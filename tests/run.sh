@@ -53,6 +53,7 @@ gpu = [l for l in installs if "--hostdev" in l]
 assert len(gpu) == 2 and all(l.count("--hostdev") == 2 for l in gpu), gpu
 assert all("X-PciMmio64Mb" in l for l in gpu)
 assert all("OVMF_CODE_4M.fd" in l and "loader_secure=no" in l and "host-passthrough" in l for l in installs)
+assert all("on_reboot=restart" in l and "device=cdrom" in l and "--cloud-init" not in l for l in installs)
 PY
 
 echo "== admin key on control-plane VMs only"
