@@ -1,0 +1,30 @@
+# Copy to lab.conf and edit. lab.conf stays out of git (it names your host's devices and paths).
+
+# Where VM disks and the base image live (thin qcow2 files; plan for the full sizes below)
+LAB_STORAGE=/var/lib/hybrid-lab/storage
+
+# Private NAT network on the host; VMs get fixed addresses from it
+LAB_NET_NAME=hybridlab
+LAB_NET_CIDR=192.168.120.0/24      # host side is .1
+LAB_NET_DOMAIN=lab.internal
+
+# One line per VM: name role vcpus memory_GiB disk_GiB ip_last_octet gpu_pci_functions (comma separated, "-" for none)
+# Each GPU line lists every function of the card (GPU and its HDMI audio): passthrough moves whole IOMMU groups.
+LAB_VMS="
+cp1        control 24 48 500 11 -
+cp2        control 24 48 500 12 -
+cp3        control 24 48 500 13 -
+gpu-amd    worker  48 96 800 21 0000:c8:00.0,0000:c8:00.1
+gpu-nvidia worker  48 96 800 22 0000:82:00.0,0000:82:00.1
+"
+
+# Admin key: the public key put on the VMs, and on which of them (all | control | none).
+# Empty = ask on the first create (default: the invoking user's ~/.ssh/id_ed25519.pub).
+LAB_ADMIN_KEY=
+LAB_ADMIN_KEY_ON=all
+
+# Login user on every VM (passwordless sudo, SSH keys only)
+LAB_VM_USER=oif
+
+# 64-bit PCI window for the guest firmware, in MiB: large enough for 48 GB GPU memory windows
+LAB_MMIO64_MB=262144

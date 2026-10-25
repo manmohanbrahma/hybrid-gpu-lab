@@ -1,0 +1,4 @@
+lab.conf
+*.qcow2
+*.img
+.cache/

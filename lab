@@ -1,0 +1,368 @@
+#!/bin/bash
+# hybrid-gpu-lab: create and destroy a set of KVM virtual machines that emulate a multi-node GPU cluster with
+# NVIDIA and AMD GPUs in separate servers: control-plane VMs plus worker VMs that each own one passed-through GPU.
+#
+#   sudo ./lab host-setup      install KVM (libvirt, QEMU, OVMF), bind the listed GPUs to vfio-pci, fetch the OS image
+#   sudo ./lab create          host-setup if needed, then the network, disks and VMs; waits until each VM answers SSH
+#   sudo ./lab destroy         remove the VMs, their disks and the network (host setup and image stay)
+#   sudo ./lab recreate        destroy, then create
+#   sudo ./lab status          VMs, addresses, GPUs
+#   sudo ./lab ssh VM [cmd]    log in to a VM (or run a command) with the lab's key
+#   sudo ./lab host-clean      destroy, then undo host-setup: GPU bindings, packages the lab installed, its folders
+#   ./lab plan                 print what create would do, without changing anything (no root needed)
+#
+# Settings: lab.conf (copy lab.conf.example). Pinned image: versions.env. State: /var/lib/hybrid-lab.
+set -eEuo pipefail
+
+LAB_HOME=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+STATE=${LAB_STATE:-/var/lib/hybrid-lab}
+LOG=/var/log/hybrid-lab.log
+KEY=$STATE/ssh/id_ed25519
+PREFIX=hl-                      # libvirt names: hl-cp1, hl-gpu-amd, ...
+PACKAGES=(qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients virtinst ovmf driverctl genisoimage)
+
+c_g=$'\e[32m' c_y=$'\e[33m' c_r=$'\e[31m' c_b=$'\e[1m' c_0=$'\e[0m'
+[ -t 1 ] || { c_g=; c_y=; c_r=; c_b=; c_0=; }
+log()  { echo "$(date '+%F %T') == $*" | tee -a "$LOG"; }
+ok()   { echo "  ${c_g}[ok]${c_0} $*" | tee -a "$LOG"; }
+warn() { echo "  ${c_y}[!]${c_0} $*" | tee -a "$LOG" >&2; }
+die()  { echo "${c_r}ERROR:${c_0} $*" | tee -a "$LOG" >&2; exit 1; }
+run()  { if [ "${DRY:-0}" = 1 ]; then printf '  + %s\n' "$*"; else "$@"; fi; }
+trap 'echo "${c_r}ERROR:${c_0} unexpected failure (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+load_config() {
+  # shellcheck source=versions.env
+  . "$LAB_HOME/versions.env"
+  local conf=$LAB_HOME/lab.conf
+  [ -f "$conf" ] || conf=$LAB_HOME/lab.conf.example
+  # shellcheck source=lab.conf.example
+  . "$conf"
+  CONF_FILE=$conf
+  NET_PREFIX=${LAB_NET_CIDR%.*/*}             # 192.168.120
+  NET_HOST=$NET_PREFIX.1
+  [[ $LAB_NET_CIDR =~ ^([0-9]+\.){3}0/24$ ]] || die "LAB_NET_CIDR must be a /24 ending in .0 (got $LAB_NET_CIDR)"
+  [[ $LAB_ADMIN_KEY_ON =~ ^(all|control|none)$ ]] || die "LAB_ADMIN_KEY_ON must be all, control or none"
+  VMS=()
+  local name role cpu mem disk ip gpus
+  while read -r name role cpu mem disk ip gpus; do
+    [ -n "$name" ] || continue
+    [[ $name =~ ^[a-z][a-z0-9-]*$ && $role =~ ^(control|worker)$ && $cpu =~ ^[0-9]+$ && $mem =~ ^[0-9]+$ \
+       && $disk =~ ^[0-9]+$ && $ip =~ ^[0-9]+$ && $ip -ge 2 && $ip -le 254 ]] \
+      || die "bad VM line in $CONF_FILE: '$name $role $cpu $mem $disk $ip $gpus'"
+    VMS+=("$name $role $cpu $mem $disk $ip ${gpus:--}")
+  done <<< "$LAB_VMS"
+  [ ${#VMS[@]} -gt 0 ] || die "no VMs in LAB_VMS"
+}
+
+vm_field() { local v; for v in "${VMS[@]}"; do read -r n r c m d i g <<< "$v"; [ "$n" = "$1" ] && { eval "echo \"\$$2\""; return 0; }; done; return 1; }
+mac_of()   { printf '52:54:00:48:4c:%02x' "$1"; }    # fixed MAC per address: 52:54:00:48:4c:<last octet>
+all_gpus() { local v; for v in "${VMS[@]}"; do read -r _ _ _ _ _ _ g <<< "$v"; [ "$g" = - ] || tr ',' '\n' <<< "$g"; done; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo $0 $*"; exit 2; }; }
+
+# --- host setup ------------------------------------------------------------------------------------------------
+
+check_host() {   # read-only: CPU virtualisation, IOMMU, devices and their groups, memory, disk
+  [ -e /dev/kvm ] || die "/dev/kvm missing: enable virtualisation (AMD-V / VT-x) in the BIOS"
+  [ -d /sys/kernel/iommu_groups ] && [ -n "$(ls /sys/kernel/iommu_groups)" ] || die "no IOMMU groups: enable the IOMMU in the BIOS"
+  local f g other want_cpu=0 want_mem=0 want_disk=0 v
+  for f in $(all_gpus); do
+    [ -e "/sys/bus/pci/devices/$f" ] || die "PCI device $f not found (lab.conf, LAB_VMS)"
+    g=$(basename "$(readlink "/sys/bus/pci/devices/$f/iommu_group")")
+    for other in /sys/kernel/iommu_groups/"$g"/devices/*; do other=${other##*/}
+      all_gpus | grep -qxF "$other" && continue
+      # PCIe bridges may share the group; any other endpoint would have to be passed through too
+      [ "$(cut -c1-4 < "/sys/bus/pci/devices/$other/class")" = 0x06 ] && continue
+      die "$f shares IOMMU group $g with $other: list every function of the card in LAB_VMS"
+    done
+  done
+  for v in "${VMS[@]}"; do read -r _ _ c m d _ _ <<< "$v"; want_cpu=$((want_cpu + c)); want_mem=$((want_mem + m)); want_disk=$((want_disk + d)); done
+  [ "$want_cpu" -le "$(nproc)" ] || warn "the VMs have $want_cpu vCPUs, the host $(nproc) threads (overcommitted)"
+  local mem_gib; mem_gib=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
+  [ "$want_mem" -le $((mem_gib - 16)) ] || die "the VMs need ${want_mem} GiB of memory; the host has ${mem_gib} GiB available (16 GiB kept for the host)"
+  local probe=$LAB_STORAGE; while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
+  local free_gib; free_gib=$(df -BG --output=avail "$probe" | tail -1 | tr -dc 0-9)
+  [ "$free_gib" -ge 100 ] || die "only ${free_gib} GiB free under $probe (LAB_STORAGE)"
+  [ "$free_gib" -ge "$want_disk" ] || warn "disks are thin: ${want_disk} GiB if full, ${free_gib} GiB free under $probe"
+  ok "host: /dev/kvm, IOMMU groups clean for $(all_gpus | wc -l) GPU functions, ${want_cpu} vCPUs / $(nproc) threads, ${want_mem} / ${mem_gib} GiB, ${free_gib} GiB free"
+}
+
+host_setup() {
+  mkdir -p "$STATE"/ssh "$LAB_STORAGE"; chmod 700 "$STATE"
+  check_host
+  local p missing=()
+  for p in "${PACKAGES[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  if [ ${#missing[@]} -gt 0 ]; then
+    log "installing ${missing[*]}"
+    printf '%s\n' "${missing[@]}" >> "$STATE/packages-installed"   # host-clean removes only these
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >> "$LOG" 2>&1 || die "apt-get install failed (see $LOG)"
+  fi
+  systemctl enable --now libvirtd >/dev/null 2>&1 || systemctl enable --now libvirtd.socket >/dev/null 2>&1 || true
+  virsh -q version >/dev/null || die "libvirt does not answer (systemctl status libvirtd)"
+  ok "KVM packages: ${#missing[@]} installed, the rest were already there"
+  bind_gpus
+  [ -f "$KEY" ] || { ssh-keygen -q -t ed25519 -N '' -C "hybrid-gpu-lab" -f "$KEY"; ok "lab SSH key created ($KEY.pub)"; }
+  fetch_image
+}
+
+bind_gpus() {   # vfio-pci for every listed function, kept across reboots (driverctl), undone by host-clean
+  local f cur
+  for f in $(all_gpus); do
+    cur=$(basename "$(readlink "/sys/bus/pci/devices/$f/driver" 2>/dev/null)" 2>/dev/null || true)
+    if [ "$cur" != vfio-pci ]; then
+      log "binding $f ($(lspci -s "$f" | cut -d' ' -f2-)) to vfio-pci, was ${cur:-none}"
+      grep -qxF "$f" "$STATE/gpu-overrides" 2>/dev/null || echo "$f" >> "$STATE/gpu-overrides"
+      driverctl set-override "$f" vfio-pci >> "$LOG" 2>&1 || die "could not bind $f to vfio-pci (see $LOG; a reboot may release it)"
+    fi
+  done
+  for f in $(all_gpus); do
+    [ "$(basename "$(readlink "/sys/bus/pci/devices/$f/driver")")" = vfio-pci ] || die "$f is not on vfio-pci"
+  done
+  ok "GPUs on vfio-pci: $(all_gpus | paste -sd' ')"
+}
+
+fetch_image() {
+  BASE=$LAB_STORAGE/base-$UBUNTU_RELEASE-$UBUNTU_IMAGE_SERIAL.qcow2
+  [ -s "$BASE" ] && return 0
+  local tmp=$LAB_STORAGE/.download.img
+  log "downloading Ubuntu $UBUNTU_RELEASE cloud image ($UBUNTU_IMAGE_SERIAL)"
+  local i; for i in 1 2 3 4 5; do
+    curl -fL --http1.1 --retry 3 --speed-limit 10240 --speed-time 60 -o "$tmp" "$UBUNTU_IMAGE_URL" >> "$LOG" 2>&1 && break
+    [ "$i" = 5 ] && die "cannot download $UBUNTU_IMAGE_URL"
+    sleep 10
+  done
+  [ "$(sha256sum "$tmp" | cut -c1-64)" = "$UBUNTU_IMAGE_SHA256" ] || { rm -f "$tmp"; die "checksum mismatch for the Ubuntu image (versions.env)"; }
+  mv "$tmp" "$BASE"; chmod 444 "$BASE"
+  ok "Ubuntu image verified: ${BASE##*/}"
+}
+
+# --- network, cloud-init, VMs ----------------------------------------------------------------------------------
+
+network_xml() {
+  local v hosts=""
+  for v in "${VMS[@]}"; do read -r n _ _ _ _ i _ <<< "$v"
+    hosts+="      <host mac='$(mac_of "$i")' name='$n' ip='$NET_PREFIX.$i'/>"$'\n'; done
+  cat <<EOF
+<network>
+  <name>$LAB_NET_NAME</name>
+  <forward mode='nat'/>
+  <bridge stp='on' delay='0'/>
+  <domain name='$LAB_NET_DOMAIN' localOnly='yes'/>
+  <ip address='$NET_HOST' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='$NET_PREFIX.100' end='$NET_PREFIX.199'/>
+${hosts}    </dhcp>
+  </ip>
+</network>
+EOF
+}
+
+admin_key() {   # the admin's public key(s) for the VMs; asked on the first create, then remembered in the state folder
+  [ -n "${ADMIN_KEY_TEXT+set}" ] && return 0
+  local f=${LAB_ADMIN_KEY:-} home ans
+  if [ -z "$f" ] && [ -r "$STATE/admin-key.pub" ]; then
+    f=$STATE/admin-key.pub; LAB_ADMIN_KEY_ON=$(cat "$STATE/admin-key-on" 2>/dev/null || echo "$LAB_ADMIN_KEY_ON")
+  elif [ -z "$f" ]; then
+    # default: the keys the invoking user logs in with (their own public key file, else their authorized_keys)
+    home=$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)
+    for f in "$home/.ssh/id_ed25519.pub" "$home/.ssh/id_rsa.pub" "$home/.ssh/authorized_keys" ""; do [ -f "$f" ] && break; done
+    if [ -t 0 ] && [ "${DRY:-0}" != 1 ]; then
+      read -r -p "Admin public key file to put on the VMs [${f:-none found}]: " ans; f=${ans:-$f}
+      read -r -p "Put it on which VMs (all / control / none) [$LAB_ADMIN_KEY_ON]: " ans; LAB_ADMIN_KEY_ON=${ans:-$LAB_ADMIN_KEY_ON}
+      [[ $LAB_ADMIN_KEY_ON =~ ^(all|control|none)$ ]] || die "answer all, control or none"
+    fi
+  fi
+  ADMIN_KEY_TEXT=""
+  if [ "$LAB_ADMIN_KEY_ON" != none ]; then
+    [ -n "$f" ] && [ -f "$f" ] || die "admin public key file '${f}' not found (set LAB_ADMIN_KEY in lab.conf)"
+    ADMIN_KEY_TEXT=$(grep -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) ' "$f" || true)
+    [ -n "$ADMIN_KEY_TEXT" ] || die "$f holds no SSH public key"
+  fi
+  if [ "${DRY:-0}" != 1 ]; then
+    printf '%s\n' "$ADMIN_KEY_TEXT" > "$STATE/admin-key.pub"; echo "$LAB_ADMIN_KEY_ON" > "$STATE/admin-key-on"; fi
+  ok "admin key: $(grep -c . <<< "$ADMIN_KEY_TEXT" || true) key(s) from ${f:-none}, on $LAB_ADMIN_KEY_ON VMs"
+}
+
+user_data() {   # vm role: cloud-init for one VM
+  local name=$1 role=$2 keys
+  keys="      - $(cat "$KEY.pub" 2>/dev/null || echo 'ssh-ed25519 LAB-KEY-PLACEHOLDER hybrid-gpu-lab')"
+  if [ -n "$ADMIN_KEY_TEXT" ] && { [ "$LAB_ADMIN_KEY_ON" = all ] || [ "$role" = control ]; }; then
+    keys+=$'\n'$(sed 's/^/      - /' <<< "$ADMIN_KEY_TEXT"); fi
+  cat <<EOF
+#cloud-config
+hostname: $name
+fqdn: $name.$LAB_NET_DOMAIN
+manage_etc_hosts: true
+users:
+  - name: $LAB_VM_USER
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+$keys
+ssh_pwauth: false
+disable_root: true
+growpart: {mode: auto, devices: ["/"]}
+write_files:
+  - path: /etc/hybrid-lab
+    content: "role=$role\n"
+EOF
+}
+
+meta_data() { printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$1" "$(date +%s)" "$1"; }
+
+create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
+  local n=$1 r=$2 c=$3 m=$4 d=$5 i=$6 g=$7 dom=$PREFIX$1 disk=$LAB_STORAGE/$PREFIX$1.qcow2 dir=$STATE/seed/$1 f
+  if [ "${DRY:-0}" != 1 ] && virsh -q dominfo "$dom" >/dev/null 2>&1; then ok "$dom exists"; return 0; fi
+  run mkdir -p "$dir"
+  if [ "${DRY:-0}" = 1 ]; then echo "  # cloud-init user-data for $n:"; user_data "$n" "$r" | sed 's/^/  | /'
+  else user_data "$n" "$r" > "$dir/user-data"; meta_data "$n" > "$dir/meta-data"; fi
+  run qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" "$disk" "${d}G"
+  # shellcheck disable=SC2054   # commas belong to the virt-install options
+  local args=(--name "$dom" --memory $((m * 1024)) --vcpus "$c" --cpu host-passthrough --machine q35
+    --boot "uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no"
+    --osinfo detect=on,require=off --import --disk "path=$disk,bus=virtio,cache=none,discard=unmap"
+    --network "network=$LAB_NET_NAME,mac=$(mac_of "$i"),model=virtio"
+    --cloud-init "user-data=$dir/user-data,meta-data=$dir/meta-data"
+    --graphics none --console pty,target_type=serial --noautoconsole --autostart)
+  if [ "$g" != - ]; then
+    for f in ${g//,/ }; do args+=(--hostdev "$f"); done
+    # room for the GPU's 48 GB memory window in the guest firmware's 64-bit PCI space
+    args+=(--qemu-commandline="-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=$LAB_MMIO64_MB")
+  fi
+  if [ "${DRY:-0}" = 1 ]; then printf '  + virt-install'; printf ' %q' "${args[@]}"; echo; return 0; fi
+  virt-install "${args[@]}" >> "$LOG" 2>&1 || die "virt-install $dom failed (see $LOG)"
+  ok "$dom started: $c vCPU, $m GiB, ${d} GiB disk, $NET_PREFIX.$i${g:+, GPU $g}"
+}
+
+wait_ready() {   # until every VM answers SSH and cloud-init has finished
+  local v n i t0=$SECONDS left
+  for v in "${VMS[@]}"; do read -r n _ _ _ _ i _ <<< "$v"
+    until vssh "$n" true 2>/dev/null; do
+      [ $((SECONDS - t0)) -lt 600 ] || die "$n ($NET_PREFIX.$i) does not answer SSH after 10 min (sudo virsh console $PREFIX$n)"
+      sleep 5; done
+    left=$(vssh "$n" "cloud-init status --wait >/dev/null 2>&1; cloud-init status | awk '{print \$2}'" 2>/dev/null || true)
+    [ "$left" = "done" ] || warn "$n: cloud-init status '$left' (sudo ./lab ssh $n sudo cloud-init status --long)"
+  done
+  ok "all ${#VMS[@]} VMs answer SSH; cloud-init finished"
+}
+
+vssh() { local n=$1; shift; local ip; ip=$NET_PREFIX.$(vm_field "$n" i) || die "no VM named $n"
+  ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR "$LAB_VM_USER@$ip" "$@"; }
+
+gpu_check() {   # every GPU VM sees each function of its card (vendor:device ids from sysfs, no tools needed)
+  local v n g f id seen
+  for v in "${VMS[@]}"; do read -r n _ _ _ _ _ g <<< "$v"; [ "$g" = - ] && continue
+    seen=$(vssh "$n" 'for d in /sys/bus/pci/devices/*; do echo "$(cat $d/vendor):$(cat $d/device)"; done')
+    for f in ${g//,/ }; do
+      id=$(cat "/sys/bus/pci/devices/$f/vendor"):$(cat "/sys/bus/pci/devices/$f/device")
+      grep -qxF "$id" <<< "$seen" || die "$n does not see $f ($id): sudo ./lab ssh $n lspci -nn"
+    done
+    ok "$n sees $(lspci -s "${g%%,*}" | cut -d' ' -f2- | sed 's/^[^:]*: //')"
+  done
+}
+
+create() {
+  host_setup
+  admin_key
+  if ! virsh -q net-info "$LAB_NET_NAME" >/dev/null 2>&1; then
+    network_xml > "$STATE/network.xml"
+    virsh -q net-define "$STATE/network.xml" >> "$LOG" 2>&1 || die "network $LAB_NET_NAME rejected (see $LOG)"
+    virsh -q net-autostart "$LAB_NET_NAME" >> "$LOG" 2>&1
+  fi
+  if [ "$(virsh -q net-info "$LAB_NET_NAME" | awk '/^Active:/ {print $2}')" != yes ]; then
+    virsh -q net-start "$LAB_NET_NAME" >> "$LOG" 2>&1 || die "network $LAB_NET_NAME did not start (see $LOG)"; fi
+  ok "network $LAB_NET_NAME: $LAB_NET_CIDR, NAT, host $NET_HOST"
+  # shellcheck disable=SC2086   # one VM line, split into its fields
+  local v; for v in "${VMS[@]}"; do create_vm $v; done
+  wait_ready
+  gpu_check
+  status
+}
+
+destroy() {
+  local v n dom
+  for v in "${VMS[@]}"; do read -r n _ <<< "$v"; dom=$PREFIX$n
+    if virsh -q dominfo "$dom" >/dev/null 2>&1; then
+      virsh -q destroy "$dom" >/dev/null 2>&1 || true
+      virsh -q undefine "$dom" --nvram --managed-save >> "$LOG" 2>&1 || virsh -q undefine "$dom" --nvram >> "$LOG" 2>&1 \
+        || die "cannot undefine $dom"
+      ok "$dom removed"
+    fi
+    rm -f "$LAB_STORAGE/$dom.qcow2"; rm -rf "$STATE/seed/$n"
+  done
+  if virsh -q net-info "$LAB_NET_NAME" >/dev/null 2>&1; then
+    virsh -q net-destroy "$LAB_NET_NAME" >/dev/null 2>&1 || true
+    virsh -q net-undefine "$LAB_NET_NAME" >> "$LOG" 2>&1 || true
+    ok "network $LAB_NET_NAME removed"
+  fi
+  # the GPUs stay on vfio-pci (host-clean gives them back to their drivers)
+  for v in $(all_gpus); do
+    [ "$(basename "$(readlink "/sys/bus/pci/devices/$v/driver" 2>/dev/null)" 2>/dev/null)" = vfio-pci ] \
+      || warn "$v is no longer on vfio-pci"; done
+  ok "lab destroyed; run 'sudo ./lab create' to build it again"
+}
+
+host_clean() {
+  destroy
+  local f p
+  if [ -f "$STATE/gpu-overrides" ]; then
+    while read -r f; do driverctl unset-override "$f" >> "$LOG" 2>&1 || warn "driverctl unset-override $f failed"; done < "$STATE/gpu-overrides"
+    ok "GPUs back on their default drivers: $(paste -sd' ' "$STATE/gpu-overrides")"
+  fi
+  if [ -s "$STATE/packages-installed" ]; then
+    mapfile -t p < <(sort -u "$STATE/packages-installed")
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${p[@]}" >> "$LOG" 2>&1 || warn "some packages were not removed (see $LOG)"
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq >> "$LOG" 2>&1 || true
+    ok "removed the packages the lab installed: ${p[*]}"
+  fi
+  rm -rf --one-file-system "$LAB_STORAGE" "$STATE"
+  ok "host back to its state before the lab (a reboot gives the GPUs a clean driver start)"
+}
+
+status() {
+  local v n r c m d i g state
+  printf '%-12s %-8s %-8s %5s %6s %6s  %-15s %s\n' VM ROLE STATE VCPU MEM_G DISK_G ADDRESS GPU
+  for v in "${VMS[@]}"; do read -r n r c m d i g <<< "$v"
+    state=$(virsh -q domstate "$PREFIX$n" 2>/dev/null | head -1 || true)
+    printf '%-12s %-8s %-8s %5s %6s %6s  %-15s %s\n' "$n" "$r" "${state:-absent}" "$c" "$m" "$d" "$NET_PREFIX.$i" "$g"
+  done
+  echo "network $LAB_NET_NAME $LAB_NET_CIDR; log in: sudo ./lab ssh <vm>, or ssh $LAB_VM_USER@<address> with the admin key ($LAB_ADMIN_KEY_ON VMs)"
+}
+
+plan() {
+  DRY=1; BASE=$LAB_STORAGE/base-$UBUNTU_RELEASE-$UBUNTU_IMAGE_SERIAL.qcow2; admin_key
+  echo "${c_b}Plan${c_0} (settings: ${CONF_FILE##*/}; nothing is changed)"
+  echo "  image: $UBUNTU_IMAGE_URL"
+  echo "  network: $LAB_NET_NAME $LAB_NET_CIDR, NAT, host $NET_HOST"
+  network_xml | sed 's/^/  | /'
+  # shellcheck disable=SC2086   # one VM line, split into its fields
+  local v; for v in "${VMS[@]}"; do create_vm $v; done
+}
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    help|-h|--help) usage; return 0 ;;
+    plan) LOG=/dev/null; load_config; plan; return 0 ;;
+    host-setup|create|destroy|recreate|status|ssh|host-clean) need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
+    *) echo "unknown command '$cmd'"; usage; exit 2 ;;
+  esac
+  BASE=$LAB_STORAGE/base-$UBUNTU_RELEASE-$UBUNTU_IMAGE_SERIAL.qcow2
+  case $cmd in
+    host-setup) host_setup ;;
+    create)     log "create"; create ;;
+    destroy)    log "destroy"; destroy ;;
+    recreate)   log "recreate"; destroy; create ;;
+    status)     status ;;
+    ssh)        [ $# -ge 1 ] || die "usage: sudo ./lab ssh VM [command]"; exec_ssh "$@" ;;
+    host-clean) log "host-clean"; host_clean ;;
+  esac
+}
+exec_ssh() { local n=$1; shift; local ip; ip=$NET_PREFIX.$(vm_field "$n" i) || die "no VM named $n"
+  exec ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$LAB_VM_USER@$ip" "$@"; }
+
+main "$@"
