@@ -137,7 +137,7 @@ sudo ./lab recreate               # destroy, then create
 
 ![A recreate: the five VMs and the network removed, then built again from the same image; both GPU VMs see their cards again.](img/h06.png)
 
-The GPUs stay on `vfio-pci` between runs, so a new VM gets its card straight away. A GPU whose driver was active when its VM was destroyed must reset before the next VM can use it; the W7900 is a workstation GPU, and this is the case worth testing on your hardware.
+The GPUs stay on `vfio-pci` between runs, so a new VM gets its card straight away. A GPU whose driver was active when its VM was destroyed must reset before the next VM can use it; workstation GPUs do not always do that cleanly. Tested on the reference host (2026-10-26): with `amdgpu` and `nvidia` loaded and in use, the lab was destroyed and created again, and in the new VMs both drivers initialised the cards as before: the W7900 with 46,064 MB registered and 48.3 GB of VRAM, the A6000 in `nvidia-smi` with 49,140 MiB. No host reboot was needed.
 
 ## SSH keys
 
