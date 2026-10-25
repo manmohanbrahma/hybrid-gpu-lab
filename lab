@@ -125,9 +125,10 @@ fetch_image() {
   [ -s "$BASE" ] && return 0
   local tmp=$LAB_STORAGE/.download.img
   log "downloading Ubuntu $UBUNTU_RELEASE cloud image ($UBUNTU_IMAGE_SERIAL)"
-  local i; for i in 1 2 3 4 5; do
-    curl -fL --http1.1 --retry 3 --speed-limit 10240 --speed-time 60 -o "$tmp" "$UBUNTU_IMAGE_URL" >> "$LOG" 2>&1 && break
-    [ "$i" = 5 ] && die "cannot download $UBUNTU_IMAGE_URL"
+  # wget ships with Ubuntu (curl may not); -c resumes a partial download after a dropped connection
+  local i; for i in $(seq 1 20); do
+    wget -q -c --tries=3 --timeout=60 -O "$tmp" "$UBUNTU_IMAGE_URL" >> "$LOG" 2>&1 && break
+    [ "$i" = 20 ] && die "cannot download $UBUNTU_IMAGE_URL (partial file kept, a re-run resumes it)"
     sleep 10
   done
   [ "$(sha256sum "$tmp" | cut -c1-64)" = "$UBUNTU_IMAGE_SHA256" ] || { rm -f "$tmp"; die "checksum mismatch for the Ubuntu image (versions.env)"; }
