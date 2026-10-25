@@ -234,7 +234,15 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
     args+=(--qemu-commandline="-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=$LAB_MMIO64_MB")
   fi
   if [ "${DRY:-0}" = 1 ]; then printf '  + virt-install'; printf ' %q' "${args[@]}"; echo; return 0; fi
-  virt-install "${args[@]}" >> "$LOG" 2>&1 || die "virt-install $dom failed (see $LOG)"
+  local t0; t0=$(date '+%F %T')
+  if ! virt-install "${args[@]}" >> "$LOG" 2>&1; then
+    grep -E '^ERROR' "$LOG" | tail -3 | sed 's/^/    /' >&2
+    # what libvirt, QEMU and AppArmor said meanwhile (the journal and QEMU's log are root-only)
+    { journalctl --no-pager -q --since "$t0" 2>/dev/null | grep -iE 'apparmor|virt-aa-helper|denied|virtqemud|libvirt' | tail -15
+      tail -5 "/var/log/libvirt/qemu/$dom.log" 2>/dev/null; } | tee -a "$LOG" | sed 's/^/    /' >&2
+    virsh -q undefine "$dom" --nvram >/dev/null 2>&1 || true; rm -f "$disk"
+    die "virt-install $dom failed (above; full output in $LOG)"
+  fi
   ok "$dom started: $c vCPU, $m GiB, ${d} GiB disk, $NET_PREFIX.$i${g:+, GPU $g}"
 }
 
