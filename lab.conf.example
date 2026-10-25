@@ -28,3 +28,8 @@ LAB_VM_USER=oif
 
 # 64-bit PCI window for the guest firmware, in MiB: large enough for 48 GB GPU memory windows
 LAB_MMIO64_MB=262144
+
+# UEFI firmware, named explicitly: left to libvirt, an EPYC host gets the AMD SEV build, which AppArmor refuses.
+# Secure boot off, so the NVIDIA driver loads in the guest.
+LAB_OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+LAB_OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd

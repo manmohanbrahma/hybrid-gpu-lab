@@ -39,6 +39,7 @@ load_config() {
   # shellcheck source=lab.conf.example
   . "$conf"
   CONF_FILE=$conf
+  : "${LAB_OVMF_CODE:=/usr/share/OVMF/OVMF_CODE_4M.fd}" "${LAB_OVMF_VARS:=/usr/share/OVMF/OVMF_VARS_4M.fd}"   # settings added after 0.1
   NET_PREFIX=${LAB_NET_CIDR%.*/*}             # 192.168.120
   NET_HOST=$NET_PREFIX.1
   [[ $LAB_NET_CIDR =~ ^([0-9]+\.){3}0/24$ ]] || die "LAB_NET_CIDR must be a /24 ending in .0 (got $LAB_NET_CIDR)"
@@ -65,6 +66,8 @@ need_root() { [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo $0 $*"; exit 2; 
 check_host() {   # read-only: CPU virtualisation, IOMMU, devices and their groups, memory, disk
   [ -e /dev/kvm ] || die "/dev/kvm missing: enable virtualisation (AMD-V / VT-x) in the BIOS"
   [ -d /sys/kernel/iommu_groups ] && [ -n "$(ls /sys/kernel/iommu_groups)" ] || die "no IOMMU groups: enable the IOMMU in the BIOS"
+  if [ -d /usr/share/OVMF ]; then   # after host-setup has installed ovmf
+    [ -f "$LAB_OVMF_CODE" ] && [ -f "$LAB_OVMF_VARS" ] || die "UEFI firmware $LAB_OVMF_CODE or $LAB_OVMF_VARS not found (LAB_OVMF_* in lab.conf)"; fi
   local f g other want_cpu=0 want_mem=0 want_disk=0 v listed
   listed=" $(all_gpus | paste -sd' ') "   # a string, not a pipe into grep -q: under pipefail that misreports a match
   for f in $(all_gpus); do
@@ -223,7 +226,7 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
   run qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" "$disk" "${d}G"
   # shellcheck disable=SC2054   # commas belong to the virt-install options
   local args=(--name "$dom" --memory $((m * 1024)) --vcpus "$c" --cpu host-passthrough --machine q35
-    --boot "uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no"
+    --boot "loader=$LAB_OVMF_CODE,loader.readonly=yes,loader.type=pflash,loader_secure=no,nvram.template=$LAB_OVMF_VARS"
     --osinfo detect=on,require=off --import --disk "path=$disk,bus=virtio,cache=none,discard=unmap"
     --network "network=$LAB_NET_NAME,mac=$(mac_of "$i"),model=virtio"
     --cloud-init "user-data=$dir/user-data,meta-data=$dir/meta-data"

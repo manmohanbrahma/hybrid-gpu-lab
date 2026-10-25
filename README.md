@@ -47,7 +47,7 @@ sudo ./lab host-clean             # destroy, then undo the host setup
 
 ## How the GPUs are passed through
 
-The guest uses UEFI (OVMF, secure boot off so the NVIDIA driver loads), a q35 machine and the host CPU model. Each GPU worker gets every function of its card as a host device, and the firmware gets a 256 GiB 64-bit PCI window (`LAB_MMIO64_MB`) so the cards' 48 GB memory windows fit. Drivers are not installed in the VMs: the cluster installer does that per node.
+The guest uses UEFI firmware named explicitly (`OVMF_CODE_4M.fd`, secure boot off so the NVIDIA driver loads; on an EPYC host libvirt would otherwise pick the AMD SEV build, which AppArmor refuses), a q35 machine and the host CPU model. Each GPU worker gets every function of its card as a host device, and the firmware gets a 256 GiB 64-bit PCI window (`LAB_MMIO64_MB`) so the cards' 48 GB memory windows fit. Drivers are not installed in the VMs: the cluster installer does that per node.
 
 ## Tests
 
