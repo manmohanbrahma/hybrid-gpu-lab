@@ -9,6 +9,7 @@
 #   sudo ./lab status          VMs, addresses, GPUs
 #   sudo ./lab ssh VM [cmd]    log in to a VM (or run a command) with the lab's key
 #   sudo ./lab host-clean      destroy, then undo host-setup: GPU bindings, packages the lab installed, its folders
+#   ./lab check                check the host: KVM, IOMMU groups of the GPUs, memory, disk (no root needed)
 #   ./lab plan                 print what create would do, without changing anything (no root needed)
 #
 # Settings: lab.conf (copy lab.conf.example). Pinned image: versions.env. State: /var/lib/hybrid-lab.
@@ -64,12 +65,13 @@ need_root() { [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo $0 $*"; exit 2; 
 check_host() {   # read-only: CPU virtualisation, IOMMU, devices and their groups, memory, disk
   [ -e /dev/kvm ] || die "/dev/kvm missing: enable virtualisation (AMD-V / VT-x) in the BIOS"
   [ -d /sys/kernel/iommu_groups ] && [ -n "$(ls /sys/kernel/iommu_groups)" ] || die "no IOMMU groups: enable the IOMMU in the BIOS"
-  local f g other want_cpu=0 want_mem=0 want_disk=0 v
+  local f g other want_cpu=0 want_mem=0 want_disk=0 v listed
+  listed=" $(all_gpus | paste -sd' ') "   # a string, not a pipe into grep -q: under pipefail that misreports a match
   for f in $(all_gpus); do
     [ -e "/sys/bus/pci/devices/$f" ] || die "PCI device $f not found (lab.conf, LAB_VMS)"
     g=$(basename "$(readlink "/sys/bus/pci/devices/$f/iommu_group")")
     for other in /sys/kernel/iommu_groups/"$g"/devices/*; do other=${other##*/}
-      all_gpus | grep -qxF "$other" && continue
+      [[ $listed == *" $other "* ]] && continue
       # PCIe bridges may share the group; any other endpoint would have to be passed through too
       [ "$(cut -c1-4 < "/sys/bus/pci/devices/$other/class")" = 0x06 ] && continue
       die "$f shares IOMMU group $g with $other: list every function of the card in LAB_VMS"
@@ -342,13 +344,14 @@ plan() {
   local v; for v in "${VMS[@]}"; do create_vm $v; done
 }
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd=${1:-help}; shift || true
   case $cmd in
     help|-h|--help) usage; return 0 ;;
     plan) LOG=/dev/null; load_config; plan; return 0 ;;
+    check) LOG=/dev/null; load_config; check_host; return 0 ;;
     host-setup|create|destroy|recreate|status|ssh|host-clean) need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
     *) echo "unknown command '$cmd'"; usage; exit 2 ;;
   esac
