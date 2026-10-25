@@ -4,6 +4,8 @@ Build and tear down, repeatably, a set of KVM virtual machines that behave like 
 
 It emulates the hybrid cluster that [Open Inference Fabric](https://github.com/manmohanbrahma/open-inference-fabric) installs on, from a single server with both GPUs. It is a separate project: it builds machines, not Kubernetes.
 
+**Guide with every step and its real output:** [docs/GUIDE.md](docs/GUIDE.md), published at <https://manmohanbrahma.github.io/ai/hybrid-gpu-lab/>.
+
 | VM | Role | vCPU | Memory | Disk | GPU |
 | --- | --- | --- | --- | --- | --- |
 | cp1, cp2, cp3 | control plane | 24 | 48 GiB | 500 GiB | none |
