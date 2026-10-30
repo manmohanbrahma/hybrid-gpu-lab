@@ -248,9 +248,9 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
     --disk "path=$seed,device=cdrom,bus=sata,readonly=on" --events on_reboot=restart
     --graphics none --console pty,target_type=serial --noautoconsole --autostart)
   if [ "$g" != - ]; then
-    # managed=no: the GPUs stay on vfio-pci (driverctl); libvirt must not hand them back to the host driver
+    # managed=no (virt-install 5.1 sets it only through xpath): the GPUs stay on vfio-pci (driverctl); libvirt must not hand them back to the host driver
     # when a VM stops (that rebind crashed the kernel in vfio-pci on kernel 7.0 and hung libvirtd)
-    for f in ${g//,/ }; do args+=(--hostdev "$f,managed=no"); done
+    for f in ${g//,/ }; do args+=(--hostdev "$f,xpath.set=./@managed=no"); done
     # room for the GPU's 48 GB memory window in the guest firmware's 64-bit PCI space
     args+=(--qemu-commandline="-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=$LAB_MMIO64_MB")
   fi
