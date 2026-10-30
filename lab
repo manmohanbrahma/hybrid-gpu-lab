@@ -40,6 +40,7 @@ load_config() {
   . "$conf"
   CONF_FILE=$conf
   : "${LAB_OVMF_CODE:=/usr/share/OVMF/OVMF_CODE_4M.fd}" "${LAB_OVMF_VARS:=/usr/share/OVMF/OVMF_VARS_4M.fd}"   # settings added after 0.1
+  : "${LAB_SHUTDOWN_WAIT:=90}"
   NET_PREFIX=${LAB_NET_CIDR%.*/*}             # 192.168.120
   NET_HOST=$NET_PREFIX.1
   [[ $LAB_NET_CIDR =~ ^([0-9]+\.){3}0/24$ ]] || die "LAB_NET_CIDR must be a /24 ending in .0 (got $LAB_NET_CIDR)"
@@ -104,9 +105,20 @@ host_setup() {
   systemctl enable --now libvirtd >/dev/null 2>&1 || systemctl enable --now libvirtd.socket >/dev/null 2>&1 || true
   virsh -q version >/dev/null || die "libvirt does not answer (systemctl status libvirtd)"
   ok "KVM packages: ${#missing[@]} installed, the rest were already there"
+  vfio_power
   bind_gpus
   [ -f "$KEY" ] || { ssh-keygen -q -t ed25519 -N '' -C "hybrid-gpu-lab" -f "$KEY"; ok "lab SSH key created ($KEY.pub)"; }
   fetch_image
+}
+
+VFIO_CONF=/etc/modprobe.d/hybrid-gpu-lab-vfio.conf
+vfio_power() {   # an idle passed-through GPU must not drop to D3: the W7900 hung in vfio runtime resume (kernel 7.0)
+  if [ ! -f "$VFIO_CONF" ]; then
+    echo 'options vfio-pci disable_idle_d3=1' > "$VFIO_CONF"; touch "$STATE/vfio-conf-created"
+    update-initramfs -u >> "$LOG" 2>&1 || warn "update-initramfs failed (see $LOG)"
+    ok "vfio-pci keeps idle GPUs powered ($VFIO_CONF; effective now if vfio-pci is not loaded yet, else after a reboot)"
+  fi
+  [ -w /sys/module/vfio_pci/parameters/disable_idle_d3 ] && echo Y > /sys/module/vfio_pci/parameters/disable_idle_d3 2>/dev/null || true
 }
 
 bind_gpus() {   # vfio-pci for every listed function, kept across reboots (driverctl), undone by host-clean
@@ -236,7 +248,9 @@ create_vm() {   # name role vcpus mem_gib disk_gib ip gpus
     --disk "path=$seed,device=cdrom,bus=sata,readonly=on" --events on_reboot=restart
     --graphics none --console pty,target_type=serial --noautoconsole --autostart)
   if [ "$g" != - ]; then
-    for f in ${g//,/ }; do args+=(--hostdev "$f"); done
+    # managed=no: the GPUs stay on vfio-pci (driverctl); libvirt must not hand them back to the host driver
+    # when a VM stops (that rebind crashed the kernel in vfio-pci on kernel 7.0 and hung libvirtd)
+    for f in ${g//,/ }; do args+=(--hostdev "$f,managed=no"); done
     # room for the GPU's 48 GB memory window in the guest firmware's 64-bit PCI space
     args+=(--qemu-commandline="-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=$LAB_MMIO64_MB")
   fi
@@ -301,11 +315,22 @@ create() {
   status
 }
 
+stop_vm() {   # a clean guest shutdown first (the GPU driver inside releases the card), then a hard stop
+  local dom=$1 i
+  [ "$(virsh -q domstate "$dom" 2>/dev/null | head -1)" = running ] || return 0
+  virsh -q shutdown "$dom" >/dev/null 2>&1 || true
+  for i in $(seq 1 "$LAB_SHUTDOWN_WAIT"); do
+    [ "$(virsh -q domstate "$dom" 2>/dev/null | head -1)" = running ] || return 0; sleep 1; done
+  warn "$dom did not shut down in ${LAB_SHUTDOWN_WAIT}s; stopping it"
+  timeout 120 virsh -q destroy "$dom" >/dev/null 2>&1 \
+    || die "virsh destroy $dom did not return in 120 s (libvirtd stuck; see dmesg). Do not reboot blindly: a stuck GPU can hang the reboot"
+}
+
 destroy() {
   local v n dom
   for v in "${VMS[@]}"; do read -r n _ <<< "$v"; dom=$PREFIX$n
     if virsh -q dominfo "$dom" >/dev/null 2>&1; then
-      virsh -q destroy "$dom" >/dev/null 2>&1 || true
+      stop_vm "$dom"
       virsh -q undefine "$dom" --nvram --managed-save >> "$LOG" 2>&1 || virsh -q undefine "$dom" --nvram >> "$LOG" 2>&1 \
         || die "cannot undefine $dom"
       ok "$dom removed"
@@ -330,6 +355,10 @@ host_clean() {
   if [ -f "$STATE/gpu-overrides" ]; then
     while read -r f; do driverctl unset-override "$f" >> "$LOG" 2>&1 || warn "driverctl unset-override $f failed"; done < "$STATE/gpu-overrides"
     ok "GPUs back on their default drivers: $(paste -sd' ' "$STATE/gpu-overrides")"
+  fi
+  if [ -f "$STATE/vfio-conf-created" ]; then
+    rm -f "$VFIO_CONF"; update-initramfs -u >> "$LOG" 2>&1 || warn "update-initramfs failed (see $LOG)"
+    ok "removed $VFIO_CONF"
   fi
   if [ -s "$STATE/packages-installed" ]; then
     mapfile -t p < <(sort -u "$STATE/packages-installed")
