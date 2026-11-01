@@ -14,7 +14,7 @@ One command line, `lab`, builds and removes it. It is a separate project from th
 
 Everything shown is from a real run on the reference host: Ubuntu 26.04.1, AMD EPYC 9684X, 751 GiB memory, an NVIDIA RTX A6000 and an AMD Radeon PRO W7900. Addresses on the lab's private subnet are shown as they are; the host's own address and name are placeholders.
 
-The published version of this guide, with the architecture diagram: <https://manmohanbrahma.github.io/ai/hybrid-gpu-lab/>.
+This lab is also the reference setup of the published guide [Run:ai with NVIDIA and AMD GPUs](https://manmohanbrahma.github.io/ai/runai-nvidia-amd/#machines), which shows its use end to end.
 
 | Step | When |
 | --- | --- |
