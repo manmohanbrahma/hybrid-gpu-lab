@@ -8,6 +8,7 @@
 #   sudo ./lab recreate        destroy, then create
 #   sudo ./lab status          VMs, addresses, GPUs
 #   sudo ./lab ssh VM [cmd]    log in to a VM (or run a command) with the lab's key
+#   sudo ./lab user-ssh        passwordless 'ssh <vm>' for you (create does this too): your key on the VMs, their host keys
 #   sudo ./lab host-clean      destroy, then undo host-setup: GPU bindings, packages the lab installed, its folders
 #   ./lab check                check the host: KVM, IOMMU groups of the GPUs, memory, disk (no root needed)
 #   ./lab plan                 print what create would do, without changing anything (no root needed)
@@ -40,7 +41,8 @@ load_config() {
   . "$conf"
   CONF_FILE=$conf
   : "${LAB_OVMF_CODE:=/usr/share/OVMF/OVMF_CODE_4M.fd}" "${LAB_OVMF_VARS:=/usr/share/OVMF/OVMF_VARS_4M.fd}"   # settings added after 0.1
-  : "${LAB_SHUTDOWN_WAIT:=90}"
+  : "${LAB_SHUTDOWN_WAIT:=90}" "${LAB_USER_SSH:=yes}"
+  [[ $LAB_USER_SSH =~ ^(yes|no)$ ]] || die "LAB_USER_SSH must be yes or no"
   NET_PREFIX=${LAB_NET_CIDR%.*/*}             # 192.168.120
   NET_HOST=$NET_PREFIX.1
   [[ $LAB_NET_CIDR =~ ^([0-9]+\.){3}0/24$ ]] || die "LAB_NET_CIDR must be a /24 ending in .0 (got $LAB_NET_CIDR)"
@@ -297,6 +299,44 @@ gpu_check() {   # every GPU VM sees each function of its card (vendor:device ids
   done
 }
 
+user_ssh() {   # passwordless ssh for the user who ran sudo: their key on every VM, the VMs' host keys, 'ssh <vm>' shortcuts
+  [ "$LAB_USER_SSH" = yes ] || return 0
+  local u=${SUDO_USER:-} home key known cfg v n i ip hk
+  [ -n "$u" ] && [ "$u" != root ] || { warn "passwordless ssh: run 'sudo ./lab user-ssh' from your own account"; return 0; }
+  home=$(getent passwd "$u" | cut -d: -f6); key=$home/.ssh/id_ed25519; known=$home/.ssh/known_hosts; cfg=$home/.ssh/config
+  runuser -u "$u" -- mkdir -p -m 700 "$home/.ssh"
+  if [ ! -f "$key.pub" ]; then
+    runuser -u "$u" -- ssh-keygen -q -t ed25519 -N '' -C "$u@$(hostname -s)" -f "$key"; ok "SSH key created for $u: $key"; fi
+  runuser -u "$u" -- touch "$known" "$cfg"; chmod 600 "$cfg"
+  echo "$u" > "$STATE/user-ssh-$LAB_NET_NAME"   # destroy removes the entries below again
+  for v in "${VMS[@]}"; do read -r n _ _ _ _ i _ <<< "$v"; ip=$NET_PREFIX.$i
+    # shellcheck disable=SC2016   # expanded on the VM
+    vssh "$n" 'k=$(cat); grep -qxF "$k" ~/.ssh/authorized_keys || echo "$k" >> ~/.ssh/authorized_keys' < "$key.pub"
+    # a recreated VM has a new host key: replace the old line instead of tripping ssh's "host identification has changed"
+    hk=$(vssh "$n" cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')
+    runuser -u "$u" -- ssh-keygen -q -R "$ip" -f "$known" >/dev/null 2>&1 || true
+    echo "$ip $hk" | runuser -u "$u" -- tee -a "$known" >/dev/null
+  done
+  runuser -u "$u" -- sed -i "/^# hybrid-gpu-lab $LAB_NET_NAME begin/,/^# hybrid-gpu-lab $LAB_NET_NAME end/d" "$cfg"
+  { echo "# hybrid-gpu-lab $LAB_NET_NAME begin (written by lab create, removed by lab destroy)"
+    for v in "${VMS[@]}"; do read -r n _ _ _ _ i _ <<< "$v"
+      printf 'Host %s\n  HostName %s\n  User %s\n' "$n" "$NET_PREFIX.$i" "$LAB_VM_USER"; done
+    echo "# hybrid-gpu-lab $LAB_NET_NAME end"; } | runuser -u "$u" -- tee -a "$cfg" >/dev/null
+  ok "passwordless ssh for $u on ${#VMS[@]} VMs: ssh <vm> (e.g. ssh -A ${VMS[0]%% *}) or ssh $LAB_VM_USER@<address>"
+}
+
+user_ssh_undo() {   # destroy: the lab's lines in that user's known_hosts and ssh config (their key stays theirs)
+  local f=$STATE/user-ssh-$LAB_NET_NAME u home v i
+  [ -f "$f" ] || return 0; u=$(cat "$f")
+  if home=$(getent passwd "$u" | cut -d: -f6) && [ -n "$home" ]; then
+    for v in "${VMS[@]}"; do read -r _ _ _ _ _ i _ <<< "$v"
+      [ -f "$home/.ssh/known_hosts" ] && runuser -u "$u" -- ssh-keygen -q -R "$NET_PREFIX.$i" -f "$home/.ssh/known_hosts" >/dev/null 2>&1 || true; done
+    [ -f "$home/.ssh/config" ] && runuser -u "$u" -- sed -i "/^# hybrid-gpu-lab $LAB_NET_NAME begin/,/^# hybrid-gpu-lab $LAB_NET_NAME end/d" "$home/.ssh/config"
+    ok "removed the lab's entries from $u's known_hosts and ssh config"
+  fi
+  rm -f "$f"
+}
+
 create() {
   host_setup
   admin_key
@@ -312,6 +352,7 @@ create() {
   local v; for v in "${VMS[@]}"; do create_vm $v; done
   wait_ready
   gpu_check
+  user_ssh
   status
 }
 
@@ -337,6 +378,7 @@ destroy() {
     fi
     rm -f "$LAB_STORAGE/$dom.qcow2" "$LAB_STORAGE/$dom-seed.iso"; rm -rf "$STATE/seed/$n"
   done
+  user_ssh_undo
   if virsh -q net-info "$LAB_NET_NAME" >/dev/null 2>&1; then
     virsh -q net-destroy "$LAB_NET_NAME" >/dev/null 2>&1 || true
     virsh -q net-undefine "$LAB_NET_NAME" >> "$LOG" 2>&1 || true
@@ -390,7 +432,7 @@ plan() {
   local v; for v in "${VMS[@]}"; do create_vm $v; done
 }
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd=${1:-help}; shift || true
@@ -398,7 +440,7 @@ main() {
     help|-h|--help) usage; return 0 ;;
     plan) LOG=/dev/null; load_config; plan; return 0 ;;
     check) LOG=/dev/null; load_config; check_host; return 0 ;;
-    host-setup|create|destroy|recreate|status|ssh|host-clean) need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
+    host-setup|create|destroy|recreate|status|ssh|user-ssh|host-clean) need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
     *) echo "unknown command '$cmd'"; usage; exit 2 ;;
   esac
   BASE=$LAB_STORAGE/base-$UBUNTU_RELEASE-$UBUNTU_IMAGE_SERIAL.qcow2
@@ -408,6 +450,7 @@ main() {
     destroy)    log "destroy"; destroy ;;
     recreate)   log "recreate"; destroy; create ;;
     status)     status ;;
+    user-ssh)   user_ssh ;;
     ssh)        [ $# -ge 1 ] || die "usage: sudo ./lab ssh VM [command]"; exec_ssh "$@" ;;
     host-clean) log "host-clean"; host_clean ;;
   esac

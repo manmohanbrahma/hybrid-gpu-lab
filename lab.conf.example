@@ -23,6 +23,10 @@ gpu-nvidia worker  48 96 800 22 0000:82:00.0,0000:82:00.1
 LAB_ADMIN_KEY=
 LAB_ADMIN_KEY_ON=all
 
+# Passwordless 'ssh <vm>' for the user who runs 'sudo ./lab create': their ~/.ssh/id_ed25519 (created if missing) on
+# every VM, the VMs' host keys in their known_hosts, 'Host <vm>' entries in their ~/.ssh/config (destroy removes both)
+LAB_USER_SSH=yes
+
 # Login user on every VM (passwordless sudo, SSH keys only)
 LAB_VM_USER=oif
 

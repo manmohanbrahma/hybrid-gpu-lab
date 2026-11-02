@@ -38,6 +38,13 @@ sudo ./lab host-clean             # destroy, then undo the host setup
 
 `create` asks once for the **admin's public key** (default: the invoking user's key, or the keys in their `authorized_keys`) and where to put it: **all** VMs, **control**-plane VMs only, or **none**. The answer is kept for later creates; set `LAB_ADMIN_KEY` and `LAB_ADMIN_KEY_ON` in `lab.conf` to skip the question. The lab also puts its own key (`/var/lib/hybrid-lab/ssh/id_ed25519`) on every VM for `./lab ssh` and its readiness checks. The VM user `oif` has passwordless sudo; password login is off.
 
+**Passwordless SSH for you.** At the end of `create`, the user who ran `sudo` gets:
+- their `~/.ssh/id_ed25519`, created without a passphrase if missing, on every VM;
+- the VMs' current host keys in their `known_hosts`, replacing old lines, so a recreated VM no longer triggers "remote host identification has changed";
+- a `Host <vm>` entry for each VM in their `~/.ssh/config`, so `ssh cp1` or `ssh -A cp1` just works.
+
+For VMs that already exist, run `sudo ./lab user-ssh`. `destroy` removes the `known_hosts` lines and the `config` entries. Your key stays yours. Set `LAB_USER_SSH=no` in `lab.conf` to skip all of this.
+
 ## What it changes on the host, and how it is undone
 
 | Change | Undone by |
