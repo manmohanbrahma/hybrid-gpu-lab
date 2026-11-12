@@ -6,7 +6,10 @@
 #   sudo ./lab create          host-setup if needed, then the network, disks and VMs; waits until each VM answers SSH
 #   sudo ./lab destroy         remove the VMs, their disks and the network (host setup and image stay)
 #   sudo ./lab recreate        destroy, then create
-#   sudo ./lab status          VMs, addresses, GPUs
+#   sudo ./lab start [VM...]   start the VMs: control planes first, workers once the Kubernetes API answers
+#   sudo ./lab stop [VM...]    shut the VMs down cleanly: workers first, then the control planes
+#   sudo ./lab restart [VM...] stop, then start (no hibernate: a VM with a passed-through GPU cannot be saved)
+#   sudo ./lab status          VMs, addresses, GPUs; Kubernetes nodes Ready, if installed
 #   sudo ./lab ssh VM [cmd]    log in to a VM (or run a command) with the lab's key
 #   sudo ./lab user-ssh        passwordless 'ssh <vm>' for you (create does this too): your key on the VMs, their host keys
 #   sudo ./lab host-clean      destroy, then undo host-setup: GPU bindings, packages the lab installed, its folders
@@ -41,7 +44,7 @@ load_config() {
   . "$conf"
   CONF_FILE=$conf
   : "${LAB_OVMF_CODE:=/usr/share/OVMF/OVMF_CODE_4M.fd}" "${LAB_OVMF_VARS:=/usr/share/OVMF/OVMF_VARS_4M.fd}"   # settings added after 0.1
-  : "${LAB_SHUTDOWN_WAIT:=90}" "${LAB_USER_SSH:=yes}"
+  : "${LAB_SHUTDOWN_WAIT:=90}" "${LAB_USER_SSH:=yes}" "${LAB_K8S_WAIT:=600}"
   [[ $LAB_USER_SSH =~ ^(yes|no)$ ]] || die "LAB_USER_SSH must be yes or no"
   NET_PREFIX=${LAB_NET_CIDR%.*/*}             # 192.168.120
   NET_HOST=$NET_PREFIX.1
@@ -356,12 +359,18 @@ create() {
   status
 }
 
+dom_state() { virsh -q domstate "$1" 2>/dev/null | head -1 || true; }   # running, shut off, in shutdown, paused; empty if absent
+
 stop_vm() {   # a clean guest shutdown first (the GPU driver inside releases the card), then a hard stop
   local dom=$1 i
-  [ "$(virsh -q domstate "$dom" 2>/dev/null | head -1)" = running ] || return 0
-  virsh -q shutdown "$dom" >/dev/null 2>&1 || true
+  case $(dom_state "$dom") in
+    running) virsh -q shutdown "$dom" >/dev/null 2>&1 || true ;;
+    paused) virsh -q resume "$dom" >/dev/null 2>&1 || true; virsh -q shutdown "$dom" >/dev/null 2>&1 || true ;;
+    "in shutdown") ;;   # already on its way down: wait for it
+    *) return 0 ;;
+  esac
   for i in $(seq 1 "$LAB_SHUTDOWN_WAIT"); do
-    [ "$(virsh -q domstate "$dom" 2>/dev/null | head -1)" = running ] || return 0; sleep 1; done
+    case $(dom_state "$dom") in running|"in shutdown"|paused) sleep 1 ;; *) return 0 ;; esac; done
   warn "$dom did not shut down in ${LAB_SHUTDOWN_WAIT}s; stopping it"
   timeout 120 virsh -q destroy "$dom" >/dev/null 2>&1 \
     || die "virsh destroy $dom did not return in 120 s (libvirtd stuck; see dmesg). Do not reboot blindly: a stuck GPU can hang the reboot"
@@ -420,6 +429,132 @@ status() {
     printf '%-12s %-8s %-8s %5s %6s %6s  %-15s %s\n' "$n" "$r" "${state:-absent}" "$c" "$m" "$d" "$NET_PREFIX.$i" "$g"
   done
   echo "network $LAB_NET_NAME $LAB_NET_CIDR; log in: sudo ./lab ssh <vm>, or ssh $LAB_VM_USER@<address> with the admin key ($LAB_ADMIN_KEY_ON VMs)"
+  local nodes; nodes=$(k8s_nodes)
+  [ -z "$nodes" ] || echo "kubernetes: $(awk '$2 == "Ready"' <<< "$nodes" | grep -c . || true) of $(grep -c . <<< "$nodes") nodes Ready"
+}
+
+# --- start, stop, restart --------------------------------------------------------------------------------------
+# No hibernate: libvirt cannot save the memory of a VM with a passed-through GPU, and saving only the control planes
+# would leave the cluster half asleep. stop and start bring it back cleanly; Kubernetes restarts its workloads.
+
+pick_vms() {   # role [vm...]: the lab's VMs of that role (control, worker, all) in lab.conf order; only the named ones if any
+  local want=$1 v n r; shift
+  for v in "${VMS[@]}"; do read -r n r _ <<< "$v"
+    [ "$want" = all ] || [ "$r" = "$want" ] || continue
+    [ $# = 0 ] || [[ " $* " == *" $n "* ]] || continue
+    echo "$n"; done
+}
+
+check_names() {   # vm...: each is in LAB_VMS
+  local a n r c m d i g
+  for a; do vm_field "$a" n >/dev/null || die "no VM named $a in LAB_VMS ($(pick_vms all | paste -sd' '))"; done
+}
+
+gpu_holder() {   # pci-function own-domain: the other running libvirt VM that has that function passed through, if any
+  local d addrs
+  for d in $(virsh -q list --name --state-running 2>/dev/null || true); do
+    [ "$d" = "$2" ] && continue
+    # the host-side address of each <hostdev> (its <source>); the guest-side address has a type attribute first
+    addrs=$(virsh dumpxml "$d" 2>/dev/null | awk '/<hostdev/,/<\/hostdev>/' \
+      | sed -nE "s/.*<address domain='0x([0-9a-f]+)' bus='0x([0-9a-f]+)' slot='0x([0-9a-f]+)' function='0x([0-9a-f]+)'.*/\1 \2 \3 \4/p" \
+      | while read -r a b s f; do printf '%04x:%02x:%02x.%x\n' $((16#$a)) $((16#$b)) $((16#$s)) $((16#$f)); done || true)
+    [[ $'\n'$addrs$'\n' == *$'\n'$1$'\n'* ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+net_up() {
+  [ "$(virsh -q net-info "$LAB_NET_NAME" 2>/dev/null | awk '/^Active:/ {print $2}' || true)" = yes ] && return 0
+  virsh -q net-start "$LAB_NET_NAME" >> "$LOG" 2>&1 || die "network $LAB_NET_NAME did not start (see $LOG; sudo ./lab create builds it)"
+  ok "network $LAB_NET_NAME started"
+}
+
+start_vm() {   # name: start one VM; refuse when another VM holds its GPU (two VMs cannot share a passed-through card)
+  local n=$1 dom=$PREFIX$1 st g f h i
+  st=$(dom_state "$dom")
+  [ -n "$st" ] || die "$dom does not exist (sudo ./lab create builds it)"
+  for i in $(seq 1 "$LAB_SHUTDOWN_WAIT"); do [ "$st" = "in shutdown" ] || break; sleep 1; st=$(dom_state "$dom"); done
+  case $st in
+    running) ok "$dom already running"; return 0 ;;
+    paused) virsh -q resume "$dom" >> "$LOG" 2>&1 || die "cannot resume $dom (see $LOG)"; ok "$dom resumed"; return 0 ;;
+    "in shutdown") die "$dom is still shutting down after ${LAB_SHUTDOWN_WAIT}s; run sudo ./lab stop $n, then start" ;;
+  esac
+  g=$(vm_field "$n" g)
+  if [ "$g" != - ]; then
+    for f in ${g//,/ }; do
+      if h=$(gpu_holder "$f" "$dom"); then die "$dom needs GPU $f, which VM $h is using: shut $h down first (sudo virsh shutdown $h)"; fi
+    done
+  fi
+  virsh -q start "$dom" >> "$LOG" 2>&1 || die "cannot start $dom (see $LOG)"
+  ok "$dom started"
+}
+
+wait_ssh() {   # vm...: until each answers SSH (10 min for all)
+  local n t0=$SECONDS
+  for n; do
+    until vssh "$n" true 2>/dev/null; do
+      [ $((SECONDS - t0)) -lt 600 ] || die "$n does not answer SSH after 10 min (sudo virsh console $PREFIX$n)"
+      sleep 5; done
+  done
+  ok "answer SSH: $*"
+}
+
+K8S_GET="sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers --request-timeout=10s"
+k8s_cp() {   # the first running control-plane VM with Kubernetes installed (kubeadm's admin.conf); none: return 1
+  local n
+  for n in $(pick_vms control); do
+    [ "$(dom_state "$PREFIX$n")" = running ] && vssh "$n" "sudo test -r /etc/kubernetes/admin.conf" 2>/dev/null && { echo "$n"; return 0; }
+  done
+  return 1
+}
+k8s_nodes() { local cp; cp=$(k8s_cp) || return 0; vssh "$cp" "$K8S_GET" 2>/dev/null || true; }   # empty if not installed or not answering
+
+wait_k8s() {   # api|ready: when Kubernetes is installed, until its API answers, or until every node is Ready (LAB_K8S_WAIT s)
+  local cp nodes off="" n t0=$SECONDS
+  cp=$(k8s_cp) || return 0
+  for n in $(pick_vms all); do [ "$(dom_state "$PREFIX$n")" = running ] || off+=" $n"; done   # lab VMs left off: not waited for
+  while :; do
+    nodes=$(vssh "$cp" "$K8S_GET" 2>/dev/null || true)
+    if [ -n "$nodes" ]; then
+      [ "$1" = api ] && { ok "Kubernetes API answers on $cp"; return 0; }
+      if awk -v off="$off " '$2 != "Ready" && index(off, " " $1 " ") == 0 {bad = 1} END {exit bad}' <<< "$nodes"; then
+        ok "Kubernetes: $(awk '$2 == "Ready"' <<< "$nodes" | grep -c . || true) of $(grep -c . <<< "$nodes") nodes Ready${off:+ (off:$off)}"; return 0; fi
+    fi
+    if [ $((SECONDS - t0)) -ge "$LAB_K8S_WAIT" ]; then
+      warn "Kubernetes not $([ "$1" = api ] && echo answering || echo Ready) after ${LAB_K8S_WAIT}s; going on"
+      [ -z "$nodes" ] || sed 's/^/    /' <<< "$nodes" >&2
+      return 0
+    fi
+    sleep 5
+  done
+}
+
+lab_start() {   # [vm...]: the network, the control planes, their Kubernetes API, then the workers, then all nodes Ready
+  local c w n
+  mapfile -t c < <(pick_vms control "$@"); mapfile -t w < <(pick_vms worker "$@")
+  net_up
+  for n in "${c[@]}"; do start_vm "$n"; done
+  if [ ${#c[@]} -gt 0 ]; then wait_ssh "${c[@]}"; [ ${#w[@]} = 0 ] || wait_k8s api; fi
+  for n in "${w[@]}"; do start_vm "$n"; done
+  [ ${#w[@]} = 0 ] || wait_ssh "${w[@]}"
+  wait_k8s ready
+  status
+}
+
+stop_group() {   # vm...: clean shutdown of these VMs, in parallel
+  local n p pids=() rc=0
+  for n; do stop_vm "$PREFIX$n" & pids+=($!); done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [ $rc = 0 ] || die "not every VM stopped (above)"
+  ok "shut off: $*"
+}
+
+lab_stop() {   # [vm...]: the workers first, then the control planes (etcd and the API stay up until the workers are gone)
+  local c w
+  mapfile -t c < <(pick_vms control "$@"); mapfile -t w < <(pick_vms worker "$@")
+  [ ${#w[@]} = 0 ] || stop_group "${w[@]}"
+  [ ${#c[@]} = 0 ] || stop_group "${c[@]}"
+  status
 }
 
 plan() {
@@ -432,7 +567,7 @@ plan() {
   local v; for v in "${VMS[@]}"; do create_vm $v; done
 }
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd=${1:-help}; shift || true
@@ -440,7 +575,8 @@ main() {
     help|-h|--help) usage; return 0 ;;
     plan) LOG=/dev/null; load_config; plan; return 0 ;;
     check) LOG=/dev/null; load_config; check_host; return 0 ;;
-    host-setup|create|destroy|recreate|status|ssh|user-ssh|host-clean) need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
+    host-setup|create|destroy|recreate|start|stop|restart|status|ssh|user-ssh|host-clean)
+      need_root "$cmd"; load_config; mkdir -p "$STATE"; touch "$LOG" ;;
     *) echo "unknown command '$cmd'"; usage; exit 2 ;;
   esac
   BASE=$LAB_STORAGE/base-$UBUNTU_RELEASE-$UBUNTU_IMAGE_SERIAL.qcow2
@@ -449,6 +585,9 @@ main() {
     create)     log "create"; create ;;
     destroy)    log "destroy"; destroy ;;
     recreate)   log "recreate"; destroy; create ;;
+    start)      check_names "$@"; log "start $*"; lab_start "$@" ;;
+    stop)       check_names "$@"; log "stop $*"; lab_stop "$@" ;;
+    restart)    check_names "$@"; log "restart $*"; lab_stop "$@"; lab_start "$@" ;;
     status)     status ;;
     user-ssh)   user_ssh ;;
     ssh)        [ $# -ge 1 ] || die "usage: sudo ./lab ssh VM [command]"; exec_ssh "$@" ;;
@@ -458,4 +597,4 @@ main() {
 exec_ssh() { local n=$1; shift; local ip; ip=$NET_PREFIX.$(vm_field "$n" i) || die "no VM named $n"
   exec ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$LAB_VM_USER@$ip" "$@"; }
 
-main "$@"
+[ "${BASH_SOURCE[0]}" != "$0" ] || main "$@"   # tests/run.sh sources the lab to test its functions
