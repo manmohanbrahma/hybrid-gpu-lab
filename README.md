@@ -29,10 +29,21 @@ cp lab.conf.example lab.conf      # set LAB_STORAGE, the GPU PCI addresses, size
 sudo ./lab create                 # host setup on first use, then the network and the VMs
 sudo ./lab status
 sudo ./lab ssh gpu-nvidia         # or: ssh oif@192.168.120.22 with the admin key
+sudo ./lab stop                   # clean shutdown: workers first, then the control planes
+sudo ./lab start                  # control planes, then workers once the Kubernetes API answers; waits for nodes Ready
+sudo ./lab restart                # stop, then start; all three also take VM names: sudo ./lab stop gpu-nvidia
 sudo ./lab destroy                # VMs, disks and network gone; host setup and image kept
 sudo ./lab recreate               # destroy, then create
 sudo ./lab host-clean             # destroy, then undo the host setup
 ```
+
+## Start, stop, restart
+
+`stop` shuts the VMs down cleanly, the workers in parallel first, then the control planes, so etcd and the Kubernetes API go last. A VM that is still running after `LAB_SHUTDOWN_WAIT` seconds (default 90) is stopped hard, with a warning. `start` starts the network if it is down, then the control planes. When Kubernetes is installed (kubeadm's `/etc/kubernetes/admin.conf` on a control plane), it waits for the API before it starts the workers, then waits until every node is Ready (`LAB_K8S_WAIT`, default 600 s). Without Kubernetes it waits for SSH only.
+
+`start` refuses a GPU worker whose card another running VM holds, and names that VM: a passed-through GPU belongs to one VM at a time. A VM still shutting down is waited for, not skipped. The VMs also start on their own when the host boots (`--autostart`), all at once; Kubernetes sorts that out, more slowly.
+
+There is no hibernate. libvirt cannot save the memory of a VM that has a passed-through GPU, and saving only the control planes would leave the cluster half asleep. `stop` and `start` bring it back cleanly, and Kubernetes restarts its workloads.
 
 ## SSH keys
 
@@ -60,7 +71,7 @@ The guest uses UEFI firmware named explicitly (`OVMF_CODE_4M.fd`, secure boot of
 
 ## Tests
 
-`tests/run.sh` runs shellcheck and renders `./lab plan` from the example settings: well-formed network XML, valid cloud-init with the right keys per role, one `virt-install` per VM with both functions of each GPU.
+`tests/run.sh` runs shellcheck and renders `./lab plan` from the example settings: well-formed network XML, valid cloud-init with the right keys per role, one `virt-install` per VM with both functions of each GPU. It also runs `start`, `stop` and `restart` against a fake `virsh`, and checks four behaviours: the start and stop order around the Kubernetes API; the refusal when another VM holds a GPU; start with VM names; and waiting for a VM still shutting down.
 
 ## License
 

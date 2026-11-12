@@ -128,6 +128,17 @@ sudo modprobe nvidia && nvidia-smi
 | gpu-amd | `linux-firmware-amd-graphics` | `amdgpu` in the Ubuntu kernel initialises the GPU |
 | gpu-nvidia | `nouveau` blocked; NVIDIA kernel modules and utilities | `nvidia-smi` shows the GPU |
 
+## Stop, start and restart
+
+```bash
+sudo ./lab stop                   # workers first, then the control planes; each VM shuts down cleanly
+sudo ./lab start                  # control planes, the Kubernetes API, then workers; waits until every node is Ready
+sudo ./lab restart                # stop, then start
+sudo ./lab stop gpu-nvidia        # one VM, e.g. to lend its GPU to another VM; start it again with: sudo ./lab start gpu-nvidia
+```
+
+`start` refuses a GPU worker whose card another running VM holds and names that VM. Shut that VM down first. There is no hibernate: libvirt cannot save a VM with a passed-through GPU. Use `stop` and `start`, and Kubernetes restarts its workloads. If a VM is still running after `LAB_SHUTDOWN_WAIT` seconds (default 90), `stop` stops it hard, with a warning.
+
 ## Destroy and create again
 
 ```bash

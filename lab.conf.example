@@ -30,6 +30,11 @@ LAB_USER_SSH=yes
 # Login user on every VM (passwordless sudo, SSH keys only)
 LAB_VM_USER=oif
 
+# stop/destroy: seconds a VM gets to shut down cleanly before it is stopped hard
+LAB_SHUTDOWN_WAIT=90
+# start: seconds to wait for the Kubernetes API, then for every node Ready (when Kubernetes is installed)
+LAB_K8S_WAIT=600
+
 # 64-bit PCI window for the guest firmware, in MiB: large enough for 48 GB GPU memory windows
 LAB_MMIO64_MB=262144
 
